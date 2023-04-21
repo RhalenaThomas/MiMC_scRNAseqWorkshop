@@ -3,7 +3,9 @@ An overview of single cell RNA sequencing: from cell ranger to annotation in Seu
 
 # Workbook for MiMC workshop April 26th, 2023
 Data is in a separate source.
-If you wish to follow this workshop we use data from
+If you wish to follow this workshop and are not part of the workshop you can find the data used here:
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE186780
+Use the CellRanger outputs
 
 # Workbook contents
 1. Creating a Seurat object from CellRanger output.
