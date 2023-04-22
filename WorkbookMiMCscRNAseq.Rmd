@@ -1,0 +1,1007 @@
+---
+title: "scRNAseq Workflow"
+output: html_notebook
+---
+
+This workbook includes:
+1. Creating a Seurat object from CellRanger output.
+2. Preparing and cleaning the data
+  a) Visualize QC
+  b) Filter out unwanted cells
+  c) Identify and remove doublets
+  d) Normalization and scale
+  e) Select Variable features
+3. Merging and Harmonizing samples
+  a) Merge samples
+  b) Use Seurat find anchors to integrate
+  c) Compare merged vs integrated
+4. Dimensional reduction clustering and visualization
+  a) PCA and component selection
+  b) UMAP
+  c) Clustering and visualization
+5. Cluster annotation
+  a) Visualize expression of known cell type markers
+  b) Find cluster markers and look them up in reference cell type library
+  c) Manual cluster annotation 
+  d) Decisions on merging clusters
+6. Automated cluster annotation
+  a) Seurat label transfer
+  b) scClassify
+
+
+# Example data
+We will use data from iPSC derived midbrain organoids
+There are two samples from dissociated midbrain organoids
+1) iPSC line from a patient with Parkinson's Disease carrying a triplication of the gene SNCA
+2) The same iPSC line CRISPR corrected to make an isogenenic control
+
+
+# Analysis workflow
+
+Load your required libraries.
+You need to have these libraries already installed. 
+
+```{r}
+Sys.time()
+library(Seurat)
+library(tidyverse)
+library(DoubletFinder)
+library(enrichR)
+library(clustree)
+library("scClassify")
+library(SingleCellExperiment)
+library("Matrix")
+
+
+```
+
+
+Load the data: Starting with the control data.
+
+```{r}
+# load data
+
+# read in the data - CellRanger output - barcodes, features, expression matrix
+
+# you need to enter the file path to the folder with the three files
+con_data <- Read10X("/Users/rhalenathomas/Documents/Data/scRNAseq/AST23_BrainComm/CellRangerOuts/AST23isogenic/raw_feature_bc_matrix")
+
+#Look at the dimensions of the matrix
+dim(con_data)
+
+#Look at a small part of the data
+con_data[1:5, 1:5]
+
+#Look at the distribution of the number of UMIs per cell
+colSums(con_data) %>% summary
+#Look at the distribution of the number of genes per cell  
+colSums(con_data > 0) %>% summary
+
+
+```
+
+
+Remove barcodes with too few genes that could be empty droplets
+
+```{r}
+#Remove barcodes with less than 100 genes detected (you can select a different value here)
+# without 
+con_data <- con_data[, colSums(con_data > 0)> 100]
+dim(con_data)
+
+
+```
+
+
+Filter genes and create a Seurat object
+
+
+```{r}
+#We might not want to include genes that occur in few cells are no cells.  Here we will filter out genes/transcripts that are in less than 3 cells. 
+# you don't have to filter any genes you can also change to any filter threshold you want
+
+#Make a Seurat object
+#Removing any genes detected in less than 3 cells
+
+# we can also filter cells at this stage too. 
+con_seu <- CreateSeuratObject(con_data, project = "Control", min.cells = 3)
+# look at the object dimensions
+con_seu
+
+```
+
+
+Data distribution
+```{r}
+# look at the distribution of total counts of RNA across cells
+con_seu$nCount_RNA %>% summary
+
+# look at the distribution of unique RNA transcripts across cells
+
+con_seu$nFeature_RNA %>% summary
+
+```
+
+
+Visualize the distributions
+
+```{r}
+
+VlnPlot(con_seu, features = c("nCount_RNA","nFeature_RNA"), pt.size = 0)
+
+```
+
+Filter out unwanted cells
+
+```{r}
+# Example cell filtering based on mitochondrial count percentage and number of UMIs ----------
+
+#Calculate the percentage of RNA encoded mitochondrial genes from the mitochondrial DNA
+con_seu <- PercentageFeatureSet(con_seu, pattern = "^MT-", col.name = "percent.MT")
+con_seu$percent.MT %>% summary
+
+VlnPlot(con_seu, features = "percent.MT", pt.size = 0.001)
+
+```
+Now we will filter some cells with too high mitochondrial RNA
+Filter out cells with too many RNA reads - these are likely doublets
+
+```{r}
+
+
+#Remove any cells with more than 20% mitochondrial counts
+con_seu.ft <- subset(con_seu, percent.MT < 20)
+
+#Remove cells with very high UMI counts, which may be possible multiplets
+con_seu.ft <- subset(con_seu.ft, nCount_RNA < 20000)
+
+# see the results
+VlnPlot(con_seu, features = c("percent.MT", "nCount_RNA", "nFeature_RNA"), pt.size = 0.001)
+
+# check how many cells we have
+con_seu.ft
+
+```
+
+We might want to filter more cells with low total and/or unique RNA
+
+```{r}
+
+# try some different filtering options
+
+
+```
+
+Apply final filtering conditions
+```{r}
+
+con_seu_ft <- subset(con_seu, nCount_RNA < 60000 & nFeature_RNA > 500 & 
+                     percent.MT < 20)
+
+dim(con_seu_ft)
+
+```
+
+Clear extra data object we don't need anymore
+
+```{r}
+
+rm(con_data,con_seu.ft)
+
+```
+
+
+Normalizing 
+
+```{r}
+# Normalize data (log normalization) and select genes with variable expression across cells --------------------------------------
+
+con_seu_ft <- NormalizeData(con_seu_ft, normalization.method = "LogNormalize", scale.factor = 10000)
+
+#Check out the effect of normalization
+GetAssayData(con_seu_ft, assay = "RNA", slot = "data") %>% expm1 %>% colSums %>% head
+GetAssayData(con_seu_ft, assay = "RNA", slot = "counts") %>% colSums %>% head
+
+```
+
+Finding Variable features 
+```{r}
+# three methods are available to choose variable features in this function
+# our selection method is vst
+con_seu_ft <- FindVariableFeatures(con_seu_ft, selection.method = "vst", nfeatures = 2000)
+
+
+var  <- VariableFeatures(con_seu_ft)
+VariableFeaturePlot(con_seu_ft)
+var[1:10]
+
+```
+
+Dimensionality reduction PCA and UMAP
+
+```{r}
+#Scaling is recommended before PCA, as otherwise highly expressed genes will have a disproportionate effect on the PC composition
+
+# we are also regressing MT genes to remove them from the PCA
+con_seu_ft <- ScaleData(con_seu_ft, vars.to.regress = "percent.MT")
+con_seu_ft@assays$RNA@scale.data %>% dim
+
+#Linear dimensionality reduction
+#Choosing the number of PCs can depend on how many cells you have
+con_seu_ft <- RunPCA(con_seu_ft, assay = "RNA", npcs = 30)
+
+PCAPlot(con_seu_ft)
+
+#Assess how many PCs capture most of the information in the data 
+ElbowPlot(con_seu_ft, ndims = 30)
+
+```
+
+We won't run this code
+I've included this analysis that calculates the cut-off for signicance of component numbers.  However the function runs multiple iterations of the PCA and will take a long time to run. 
+
+```{r}
+# Jackstraw
+
+#Assess how many PCs capture most of the information in the data 
+seu <-JackStraw(seu, reduction = "pca",
+  dims = 30)
+seu <- ScoreJackStraw(seu, reduction = "pca", dims = 1:30)
+JackStrawPlot(seu, dims = 1:30)
+
+```
+
+
+Non-linear dimensional reduction using UMAP
+```{r}
+
+#Non-linear dimensionality reduction
+#Choosing how many PCs to input can depend on the elbow plot and on the number of cells
+#There are many parameters that can e tweaked and optimized in a UMAP plot
+#You can see some demos here: https://pair-code.github.io/understanding-umap/
+con_seu_ft <- RunUMAP(con_seu_ft, dims = 1:18)
+UMAPPlot(con_seu_ft)
+
+
+```
+
+
+Doublet identification
+
+```{r}
+
+# Assess possible doublets  -----------------------------------------------
+#Using instructions here: https://github.com/chris-mcginnis-ucsf/
+
+#First we have to find a pK which determines how big of a neighborhood will be examined for doublets
+#This should be chosen for each library separately
+#First we test a number of pN (proportion of generated artificial doublets) and pK
+#We get different lists of probabilities of artifical nearest neighbors with these tested parameters
+#Also keep in mind the results are not deterministic (every run will give slightly different results)
+sweep.res.con <- paramSweep_v3(con_seu_ft, PCs = 1:18, sct = FALSE)
+
+#We do not have the "ground truth" regarding doublets, such from from genotype data for pooled samples 
+#We sumamrize the performance of the range of pN=pK parameters we tested
+sweep.stats_con <- summarizeSweep(sweep.res.con, GT = FALSE)
+
+#Here the "best" pK for the data is chosen based on a metric determined by the DoubletFinder developers
+#Which performs best in datasets where the ground truth is known
+bcmvn_con <- find.pK(sweep.stats_con)
+ggplot(bcmvn_con, aes(x = pK, y = BCmetric, group = "Sweep")) + geom_point() + geom_line() + 
+  theme(axis.text.x = element_text(angle = 90))
+
+```
+
+
+```{r}
+
+#We will pick pK = 0.08
+#We are not going to use our clustering information to estimate "homotypic" doublets
+#We are simply going to use an expected doublet formation rate of 2.5% based on the number of starting cells loaded
+
+nExp_poi <- round(0.025*nrow(con_seu_ft@meta.data))
+con_seu_ft <- doubletFinder_v3(con_seu_ft, PCs = 1:18, pN = 0.25, pK = 0.08, nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+
+#Here we update the Seurat object version just in case the one returned by DoubletFinder is an older version
+con_seu_ft <- UpdateSeuratObject(con_seu_ft)
+
+# we have now identified doublets but we have not removed them
+
+
+```
+
+Visualize the doublet removal results
+
+```{r}
+
+# we need to look in the data object
+
+#Visualize and assess the cells called as probable doublets
+UMAPPlot(con_seu_ft, group.by = "DF.classifications_0.25_0.08_73")
+
+# table of doublets and signlets
+con_seu_ft$DF.classifications_0.25_0.08_73 %>% table
+
+# visualize the features in doublets and singlets
+VlnPlot(con_seu_ft, features = c("nCount_RNA", "nFeature_RNA", "percent.MT", "pANN_0.25_0.08_73"), 
+        group.by = "DF.classifications_0.25_0.08_73", pt.size = 0.001, ncol = 2, log = TRUE)
+
+```
+
+```{r}
+# remove the doublets
+# we can do this by subset
+# first we need to set the active meta data slot to the doublet identification
+Idents(con_seu_ft) <- "DF.classifications_0.25_0.08_73"
+# we select only the singlet cells
+con_seu_ft2 <- subset(con_seu_ft, idents = "Singlet")
+dim(con_seu_ft)
+dim(con_seu_ft2)
+
+```
+
+
+
+
+Repeat the above steps for the SNCA triplication patient line
+
+```{r}
+# read in data
+
+ast_data <- Read10X("/Users/rhalenathomas/Documents/Data/scRNAseq/AST23_BrainComm/CellRangerOuts/AST23/raw_feature_bc_matrix")
+
+
+# create seurat object
+
+
+# filter object with the same settings as with the control
+
+
+# PCA analysis
+
+# Remove doublets
+
+
+
+```
+
+
+```{r}
+# clean up 
+rm(ast_data,ast_seu_ft,bcmvn_ast,bcmvn_con,con_seu_ft, sweep.res.ast, sweep.res.con, sweep.stats_ast, sweep.stats_con)
+```
+
+
+# BREAK
+
+Merge data objects
+
+```{r}
+
+merge_seurat <- merge(con_seu_ft2,ast_seu_ft2)
+merge_seurat
+
+unique(merge_seurat$orig.ident)
+
+
+```
+
+Find anchors between the two data objects
+```{r}
+sample.list <- SplitObject(merge_seurat, split.by = "orig.ident")
+
+# We have already normalized and identified variable features in each sample
+# If we had not done so we can normalize here
+#for (i in 1:length(sample.list)){
+ # org.list[[i]] <- NormalizeData(org.list[[i]], verbose = FALSE)
+  #org.list[[i]] <- FindVariableFeatures(org.list[[i]], selection.method = "vst")
+#}
+
+# Now we find features that can act as anchors between the two samples
+int.anchors <- FindIntegrationAnchors(object.list = sample.list, dims = 1:50)
+integrated_seurat <- IntegrateData(anchorset = int.anchors, dims = 1:50)
+
+```
+
+
+Optional: save the integrated object or read in the Integrated object for the next step.
+
+```{r}
+# remove # comment from the code you want to run
+
+saveRDS(integrated_seurat,"IntegratedSeurat.RDS")
+#integrated_seurate <- readRDS("IntegratedSeurat.RDS")
+
+```
+
+PCA and UMAP on the merged object
+
+```{r}
+# merged object
+
+DefaultAssay(merge_seurat) <- "RNA"
+
+merge_seurat <- ScaleData(merge_seurat, verbose = FALSE)
+# in the merge data set we sill need features for the PCA input
+merge_seurat <- FindVariableFeatures(merge_seurat, selection.method = "vst")
+merge_seurat <- RunPCA(merge_seurat, npcs = 30, verbose = FALSE)
+merge_seurat <- RunUMAP(merge_seurat, reduction = "pca", dims = 1:30)
+
+
+```
+
+
+
+Repeat PCA and UMAP for the integrated object
+
+```{r}
+Idents(integrated_seurat) <- "integrated"
+integrated_seurat <- ScaleData(integrated_seurat, verbose = FALSE)
+# only the integrated features will be the pca input
+
+integrated_seurat <- RunPCA(integrated_seurat, npcs = 30, verbose = FALSE)
+integrated_seurat <- RunUMAP(integrated_seurat, reduction = "pca", dims = 1:30)
+
+```
+
+
+Optional: save the PCA and UMAP integrated object or read in the saved object
+```{r}
+# remove # comment from the code you want to run
+saveRDS(integrated_seurat,"IntegratedSeuratGraphs.RDS")
+#integrated_seurat <- readRDS("IntegratedSeuratGraphs.RDS")
+
+```
+
+Let's look at the UMAPs from the merged vs the integrated data
+```{r}
+
+p1 <- DimPlot(merge_seurat, group.by = "orig.ident") + ggtitle("Merge")
+p2 <- DimPlot(integrated_seurat, group.by = "orig.ident") + ggtitle("Integrated")
+
+p1
+p2
+
+```
+We see almost no difference in this data. This is not the case in all data sets
+
+Cluster the integrated data
+
+```{r}
+# see the importance of the pca components
+ElbowPlot(integrated_seurat, ndims=30)
+integrated_seurat
+
+```
+
+```{r}
+dim(integrated_seurat)
+
+```
+
+We will choose 20 PCs
+There are 4028 cells.  A common rule of thumb for choosing k for nearest neighbours is using the square root of the number of cells = 63
+
+```{r}
+# calculate the square root
+sqrt(4028)
+
+# the K parameter changes the size of clusters by changing the starting nodes input into the Louvain network
+
+integrated_seurat <- FindNeighbors(integrated_seurat, dims = 1:20, k.param = 63)
+# the number of clusters is dependent on the resolution a number from 0-2. 
+# Higher values make more clusters
+# we include 
+integrated_seurat <- FindClusters(integrated_seurat, resolution = c(0,0.05,0.25,0.4,0.5,0.6,1,1.5) )
+
+# we can visualize which cells are grouped together at different resolutions using clustree
+
+clustree(integrated_seurat, prefix = "integrated_snn_res.")
+
+```
+
+
+Visualize the UMAP of the different cluster resolutions
+```{r}
+res <- c(0.05,0.25,0.4,0.5,0.6,1,1.5)
+resolutions <- paste("integrated_snn_res.", res, sep="")
+resolutions
+
+for(r in resolutions){
+  print(DimPlot(integrated_seurat, group.by = r))
+}
+
+
+```
+
+# BREAK
+
+
+Now we need to choose a resolution to annotate.
+I will select resolution of 0.6.
+
+```{r}
+# Scale the total RNA
+# before we only scaled the integrated expression for the genes used for integration
+# now we want to scale all genes
+
+DefaultAssay(integrated_seurat) <- "RNA"
+integrated_seurat <- ScaleData(integrated_seurat)
+
+
+```
+
+
+
+Look at known cell type markers
+
+```{r}
+# features list from literature
+
+da_neurons <- c("TH","SLC6A3","SLC18A2","SOX6","NDNF","SNCG","ALDH1A1","CALB1","TACR2","SLC17A6","SLC32A1","OTX2","GRP","LPL","CCK","VIP")
+NPC_orStemLike <- c("DCX","NEUROD1","TBR1","PCNA","MKI67","SOX2","NES","PAX6","MASH1")
+mature_neurons = c("RBFOX3","SYP","DLG45","VAMP1","VAMP2","TUBB3","SYT1","BSN","HOMER1","SLC17A6")
+excitatory_neurons = c("GRIA2","GRIA1","GRIA4","GRIN1","GRIN2B","GRIN2A","GRIN3A","GRIN3","GRIP1","CAMK2A")
+inhbitory_neurons = inh = c("GAD1","GAD2", "GAT1","PVALB","GABR2","GABR1","GBRR1","GABRB2","GABRB1","GABRB3","GABRA6","GABRA1","GABRA4","TRAK2")
+astrocytes <- c("GFAP","S100B","AQP4","APOE", "SOX9","SLC1A3")
+oligodendrocytes <- c("MBP","MOG","OLIG1","OLIG2","SOX10")
+opc <- 
+radial_glia <- c("PTPRC","AIF1","ADGRE1", "VIM", "TNC","PTPRZ1","FAM107A","HOPX","LIFR",
+              "ITGB5","IL6ST","SLC1A3")
+epithelial <- c("HES1","HES5","SOX2","SOX10","NES","CDH1","NOTCH1")
+
+microglia <- c("IBA1","P2RY12","P2RY13","TREM119", "GPR34","SIGLECH","TREM2",
+               "CX3CR1","FCRLS","OLFML3","HEXB","TGFBR1", "SALL1","MERTK",
+               "PROS1")
+
+features_list <- c("MKI67","SOX2","POU5F1","DLX2","PAX6","SOX9","HES1","NES","RBFOX3","MAP2","NCAM1","CD24","GRIA2","GRIN2B","GABBR1","GAD1","GAD2","GABRA1","GABRB2","TH","ALDH1A1","LMX1B","NR4A2","CORIN","CALB1","KCNJ6","CXCR4","ITGA6","SLC1A3","CD44","AQP4","S100B", "PDGFRA","OLIG2","MBP","CLDN11","VIM","VCAM1")
+
+short_list <- c("MKI67","SOX9","HES1","NES","DLX2","RBFOX3","MAP2","TH","CALB1","KCNJ6","SLC1A3","CD44","AQP4","S100B","OLIG2","MBP","VIM")
+
+
+```
+
+Seurat has several helpful plotting function that use ggplot
+
+```{r}
+# we set the active identity of the meta data to be the clusters at the resolution we want to label
+Idents(integrated_seurat) <- "integrated_snn_res.0.6"
+
+FeaturePlot(integrated_seurat, label = TRUE, features = short_list)
+
+
+
+```
+
+
+```{r}
+# this will let us see one at at time
+for (i in short_list) {
+  print(FeaturePlot(integrated_seurat, features = i, min.cutoff = 'q1', max.cutoff = 'q97', label = TRUE))
+}
+
+
+```
+Now that we see the TH is all in one spot that is part of a large cluster we look back at the different cluster level.
+
+```{r}
+# look at the Feature plots with the cluster resolution 1
+
+
+```
+
+
+Dot Plots
+
+```{r}
+
+DotPlot(integrated_seurat, group.by = "integrated_snn_res.1", 
+        features = short_list, assay = "RNA") + RotatedAxis()
+
+
+
+DotPlot(integrated_seurat, group.by = "integrated_snn_res.1", 
+        features = da_neurons, assay = "RNA") + RotatedAxis()
+
+DotPlot(integrated_seurat, group.by = "integrated_snn_res.1", 
+        features = mature_neurons, assay = "RNA") + RotatedAxis()
+
+
+```
+
+Heatmaps
+
+```{r}
+
+
+DoHeatmap(integrated_seurat, group.by = "integrated_snn_res.1", 
+        features = short_list, slot = "scale.data")
+
+```
+
+Look at more expression lists
+
+```{r}
+
+
+```
+
+
+Find Cluster markers
+
+```{r}
+# cluster markers will be calculated for the active identity
+
+Idents(integrated_seurat) <- "integrated_snn_res.1"
+ClusterMarkers <- FindAllMarkers(integrated_seurat, only.pos = TRUE)
+
+# optional: save the cluster markers
+write.csv(ClusterMarkers,"ClusterMarkers.csv")
+
+```
+
+See the top cluster markers
+
+```{r}
+head(ClusterMarkers)
+top5 <- ClusterMarkers %>% group_by(cluster) %>% top_n(n=5, wt =avg_log2FC)
+
+top2 <- ClusterMarkers %>% group_by(cluster) %>% top_n(n=2, wt =avg_log2FC)
+DoHeatmap(integrated_seurat, features = top5$gene, size = 3, angle = 90, group.by = "integrated_snn_res.1")
+
+DoHeatmap(integrated_seurat, features = top2$gene, size = 3, angle = 90, group.by = "integrated_snn_res.1")
+
+```
+
+Now we can look at the cluster markers for cluster using EnrichR to compare to reference libraries
+
+```{r}
+
+
+setEnrichrSite("Enrichr") # Human genes
+# list of all the databases
+
+dbs <- listEnrichrDbs()
+
+# this will list the possible libraries
+dbs
+
+# select libraries with cell types
+db <- c('CellMarker_Augmented_2021','Azimuth_Cell_Types_2021')
+
+
+```
+
+
+
+Here is a small function to run easily on each cluster and find the cell type library predictions (specific to the libraries I selected)
+
+```{r}
+
+checkCelltypes <- function(cluster_num = 0){
+  clusterX <- ClusterMarkers %>% filter(cluster == cluster_num & avg_log2FC > 0.25)
+  genes <- clusterX$gene
+  # the cell type libraries
+  # get the results for each library
+  clusterX.cell <- enrichr(genes, databases = db)
+  # visulize the results
+print(plotEnrich(clusterX.cell[[1]], showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value", title = 'CellMarker_Augmented_2021'))
+print(plotEnrich(clusterX.cell[[2]], showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value", title = 'Azimuth_Cell_Types_2021'))
+
+}
+
+```
+
+Run the function for each cluster to see if we can identify cell types
+
+```{r}
+
+cluster0 <- checkCelltypes(cluster_num = 0)
+
+```
+Cluster 0 is likely immature neurons - possibly both Glutamatergic and gabaergic
+
+```{r}
+cluster1 <- checkCelltypes(cluster_num = 1)
+```
+Cluster 1 is astrocytes
+
+```{r}
+
+checkCelltypes(cluster_num = 11)
+
+```
+
+After we have looked at all the clusters we add manual annotations
+
+
+```{r}
+
+# we need to set the identity to rename
+Idents(integrated_seurat) <- "integrated_snn_res.1"
+
+# we need to make a vector of the cell type in the same order - in the cluster order
+
+cell_types1 <- c("neurons_immature", "astrocytes_1","glia",
+                 "neurons_mature","OPC","endothelial_1",
+                 "endothelial_2","astrocyte_2","RadialGlia",
+                 "neurons1","neurons_GABA","neurons2","neural_stem","DAneurons")
+  
+names(cell_types1) <- levels(integrated_seurat)
+integrated_seurat <- RenameIdents(integrated_seurat, cell_types1)
+integrated_seurat <- AddMetaData(object=integrated_seurat, metadata=Idents(integrated_seurat), col.name = "CellTypes")
+
+
+```
+
+
+Lets look at the annotations on the UMAP
+
+```{r}
+
+DimPlot(integrated_seurat, group.by = "CellTypes", label = TRUE)
+
+```
+
+
+# BREAK
+
+
+Automated annotation 
+We require reference data objects for both methods we will use
+
+```{r}
+
+# developing forebrain
+devforebrain <- readRDS("/Users/rhalenathomas/Documents/Data/scRNAseq/PublicData/Karolinski_DevForebrain_downsample_Level1.RDS")
+
+# developing cortex
+
+devcotex <- readRDS("/Users/rhalenathomas/Documents/Data/scRNAseq/PublicData/Nowakowski_dev_cortext.RDS")
+
+# adult midbrain
+
+midbrain <- readRDS("/Users/rhalenathomas/Documents/Data/scRNAseq/PublicData/KamathTotal_downsample.RDS")
+
+#check the meta data
+print("Developing Forebrain")
+colnames(devforebrain@meta.data)
+print("Developing cortex")
+colnames(devcotex@meta.data)
+print("Adult midbrain")
+colnames(midbrain@meta.data)
+
+# we need to know the metadata slot name to use
+
+
+```
+
+Seurat label transfer using find anchors - predicts cell types from a reference Seurat object
+
+```{r}
+
+# set the active meta data to be the cell type labels we want
+
+Idents(devforebrain) <- "Celltypes"
+# set the default assay to be RNA because those are the expression values we want
+DefaultAssay(devforebrain) <- "RNA"
+
+# find the reference anchors
+anchors <- FindTransferAnchors(reference = devforebrain ,query = integrated_seurat, dims = 1:25)
+
+# now we make predictions with the anchors
+predictions <- TransferData(anchorset = anchors, refdata = devforebrain$Celltypes)
+
+# look at the predictions output
+head(predictions)
+
+# add the predictions to the meta data
+integrated_seurat <- AddMetaData(integrated_seurat, metadata = predictions$predicted.id, col.name = "predicted_ID")
+
+# we can also consider the probability of each prediction
+integrated_seurat$predicted_threshold <- ifelse(predictions$prediction.score.max > 0.75, integrated_seurat$predicted_ID, "None")
+
+ 
+## check the proportion of cell types predicted in each cluster
+
+t.lables <- as.data.frame(table(integrated_seurat$integrated_snn_res.1, 
+                                integrated_seurat$predicted_ID))
+t.lables$Freq <- as.double(t.lables$Freq)
+ggplot(t.lables, aes(y = Freq, x = Var1, fill = Var2)) + geom_bar(position = "stack", stat= "identity")
+
+# see predictions by cluster in a table
+top.pred <- as.data.frame(t.lables  %>% group_by(Var1)  %>% top_n(2, Freq)) %>% arrange(Var1, desc(Freq))
+top.pred
+
+
+
+```
+
+
+
+
+scClassify R weighted kNN https://doi.org/10.15252/msb.20199389
+https://sydneybiox.github.io/scClassify/articles/scClassify.html
+
+We need to make the reference and query objects into a "dgCMatrix" object
+
+```{r}
+ref <- devforebrain
+
+ref$Level1 <- NULL
+
+colnames(ref@meta.data)
+
+
+# make a dfCMatrix from Seurat object to use in scClassify
+Idents(ref) <- "Celltypes"
+
+dgCMat_ref <- GetAssayData(ref)
+# get the cell type data
+Idents(ref) <- "Celltypes"
+ref_celltypes <- Idents(ref)
+unique(ref_celltypes)
+
+
+# convert the integrated clustered object into dgCMatrix
+DefaultAssay(integrated_seurat) <- "RNA"
+dgCMat_query <- GetAssayData(integrated_seurat)
+
+# get the meta data to group predictions by
+# we will use the clusters ids 
+# we could use the cell type annotations we made above
+
+Idents(integrated_seurat) <- "integrated_snn_res.1"
+query_clusters <- Idents(integrated_seurat)
+
+# check the objects
+dim(dgCMat_ref)
+dim(dgCMat_query)
+
+class(dgCMat_ref)
+class(dgCMat_query)
+
+```
+
+See the original cell type annotations
+```{r}
+table(ref_celltypes)
+table(query_clusters)
+
+length(ref_celltypes)
+length(query_celltypes)
+
+```
+
+Run scClassify
+```{r}
+
+scClassify_res <- scClassify(exprsMat_train = dgCMat_ref,
+                             cellTypes_train = ref_celltypes,
+                             exprsMat_test = dgCMat_query,
+                             cellTypes_test = query_clusters,
+                             tree = "HOPACH",
+                             algorithm = "WKNN",
+                             selectFeatures = c("limma"),
+                             similarity = c("pearson"),
+                             returnList = FALSE,
+                             verbose = FALSE)
+
+```
+
+```{r}
+
+
+plotCellTypeTree(cellTypeTree(scClassify_res$trainRes))
+
+
+```
+
+
+
+See the cell type predictions by cluster
+
+```{r}
+
+table(scClassify_res$testRes$test$pearson_WKNN_limma$predRes,query_clusters)
+
+
+```
+
+
+Check another reference set
+
+```{r}
+# refrence data
+# we have the data prepared as a Seurat object
+
+ref2 <- midbrain
+ref2
+
+#check the meta data
+colnames(ref2@meta.data)
+
+#make the reference matrix and reference cell types 
+
+
+dgCMat_ref2 <- GetAssayData(ref2)
+# get the cell type data
+Idents(ref2) <- "Cell_Type" 
+ref_celltypes2 <- Idents(ref2)
+unique(ref_celltypes2)
+
+# check the object
+dim(dgCMat_ref2)
+
+
+class(dgCMat_ref2)
+
+
+
+```
+
+```{r}
+# predict the cluster cell types from the second reference
+scClassify_res <- scClassify(exprsMat_train = dgCMat_ref2,
+                             cellTypes_train = ref_celltypes2,
+                             exprsMat_test = dgCMat_query,
+                             cellTypes_test = query_clusters,
+                             tree = "HOPACH",
+                             algorithm = "WKNN",
+                             selectFeatures = c("limma"),
+                             similarity = c("pearson"),
+                             returnList = FALSE,
+                             verbose = FALSE)
+Sys.time()
+
+```
+
+```{r}
+
+plotCellTypeTree(cellTypeTree(scClassify_res$trainRes))
+
+```
+
+See the predictions by cluster
+
+```{r}
+table(scClassify_res$testRes$test$pearson_WKNN_limma$predRes,query_clusters)
+
+
+
+```
+
+```{r}
+# reformat to see the top predictions for each cluster
+
+pred_counts <- as.data.frame(table(query_clusters,scClassify_res$testRes$test$pearson_WKNN_limma$predRes))
+
+pred_counts$Freq <- as.double(pred_counts$Freq)
+
+head(pred_counts)
+# see predictions by cluster in a table
+top.pred <- as.data.frame(pred_counts  %>% group_by(query_clusters)  %>% top_n(2, Freq)) %>% arrange(query_clusters, desc(Freq))
+top.pred
+
+
+```
+
+
+Add prediction annotations
+
+
+```{r}
+
+
+```
+
+Adjust annotations - merge clusters or not
+
+```{r}
+
+
+```
+
+
+
+
