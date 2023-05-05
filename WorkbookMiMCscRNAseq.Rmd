@@ -64,7 +64,7 @@ Load the data: Starting with the control data.
 # read in the data - CellRanger output - barcodes, features, expression matrix
 
 # you need to enter the file path to the folder with the three files
-con_data <- Read10X("/Users/rhalenathomas/Documents/Data/scRNAseq/AST23_BrainComm/CellRangerOuts/AST23isogenic/raw_feature_bc_matrix")
+con_data <- Read10X("/Users/rhalenathomas/Documents/Data/scRNAseq/AST23_BrainComm/CellRangerOuts/AST23isogenic/raw_feature_bc_matrix") 
 
 #Look at the dimensions of the matrix
 dim(con_data)
@@ -78,6 +78,7 @@ colSums(con_data) %>% summary
 colSums(con_data > 0) %>% summary
 
 
+
 ```
 
 
@@ -88,7 +89,7 @@ Remove barcodes with too few genes that could be empty droplets
 # without 
 con_data <- con_data[, colSums(con_data > 0)> 100]
 dim(con_data)
-
+colSums(con_data) %>% summary
 
 ```
 
@@ -156,10 +157,13 @@ con_seu.ft <- subset(con_seu, percent.MT < 20)
 con_seu.ft <- subset(con_seu.ft, nCount_RNA < 20000)
 
 # see the results
-VlnPlot(con_seu, features = c("percent.MT", "nCount_RNA", "nFeature_RNA"), pt.size = 0.001)
+VlnPlot(con_seu.ft, features = c("percent.MT", "nCount_RNA", "nFeature_RNA"), pt.size = 0.001)
 
 # check how many cells we have
 con_seu.ft
+
+VlnPlot(con_seu.ft, features = "nFeature_RNA", pt.size = 0.001, y.max = 1000)
+
 
 ```
 
@@ -168,6 +172,9 @@ We might want to filter more cells with low total and/or unique RNA
 ```{r}
 
 # try some different filtering options
+con_seu.ft <- subset(con_seu, percent.MT < 20)
+dim(con_seu)
+dim(con_seu.ft)
 
 
 ```
@@ -214,6 +221,8 @@ con_seu_ft <- FindVariableFeatures(con_seu_ft, selection.method = "vst", nfeatur
 var  <- VariableFeatures(con_seu_ft)
 VariableFeaturePlot(con_seu_ft)
 var[1:10]
+
+
 
 ```
 
@@ -435,7 +444,7 @@ merge_seurat <- RunUMAP(merge_seurat, reduction = "pca", dims = 1:30)
 Repeat PCA and UMAP for the integrated object
 
 ```{r}
-Idents(integrated_seurat) <- "integrated"
+DefaultAssay(integrated_seurat) <- "integrated"
 integrated_seurat <- ScaleData(integrated_seurat, verbose = FALSE)
 # only the integrated features will be the pca input
 
@@ -559,6 +568,7 @@ features_list <- c("MKI67","SOX2","POU5F1","DLX2","PAX6","SOX9","HES1","NES","RB
 short_list <- c("MKI67","SOX9","HES1","NES","DLX2","RBFOX3","MAP2","TH","CALB1","KCNJ6","SLC1A3","CD44","AQP4","S100B","OLIG2","MBP","VIM")
 
 
+
 ```
 
 Seurat has several helpful plotting function that use ggplot
@@ -574,6 +584,7 @@ FeaturePlot(integrated_seurat, label = TRUE, features = short_list)
 ```
 
 
+
 ```{r}
 # this will let us see one at at time
 for (i in short_list) {
@@ -585,8 +596,14 @@ for (i in short_list) {
 Now that we see the TH is all in one spot that is part of a large cluster we look back at the different cluster level.
 
 ```{r}
-# look at the Feature plots with the cluster resolution 1
 
+# see the difference between samples
+FeaturePlot(integrated_seurat, features = "VIM", min.cutoff = 'q1', max.cutoff = 'q97', label = TRUE, split.by = "orig.ident")
+
+
+# look at the Feature plots with the cluster resolution 1
+Idents(integrated_seurat) <- "integrated_snn_res.1"
+FeaturePlot(integrated_seurat, label = TRUE, features = c("VIM","AQP4"))
 
 ```
 
@@ -617,6 +634,7 @@ Heatmaps
 DoHeatmap(integrated_seurat, group.by = "integrated_snn_res.1", 
         features = short_list, slot = "scale.data")
 
+
 ```
 
 Look at more expression lists
@@ -636,7 +654,9 @@ Idents(integrated_seurat) <- "integrated_snn_res.1"
 ClusterMarkers <- FindAllMarkers(integrated_seurat, only.pos = TRUE)
 
 # optional: save the cluster markers
-write.csv(ClusterMarkers,"ClusterMarkers.csv")
+#write.csv(ClusterMarkers,"ClusterMarkers.csv")
+
+
 
 ```
 
@@ -684,11 +704,12 @@ checkCelltypes <- function(cluster_num = 0){
   # the cell type libraries
   # get the results for each library
   clusterX.cell <- enrichr(genes, databases = db)
-  # visulize the results
+  # visualize the results
 print(plotEnrich(clusterX.cell[[1]], showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value", title = 'CellMarker_Augmented_2021'))
 print(plotEnrich(clusterX.cell[[2]], showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value", title = 'Azimuth_Cell_Types_2021'))
 
 }
+
 
 ```
 
@@ -703,6 +724,11 @@ Cluster 0 is likely immature neurons - possibly both Glutamatergic and gabaergic
 
 ```{r}
 cluster1 <- checkCelltypes(cluster_num = 1)
+
+as.data.frame(cluster1$data)
+cluster1[["data"]]
+
+
 ```
 Cluster 1 is astrocytes
 
@@ -785,6 +811,8 @@ Seurat label transfer using find anchors - predicts cell types from a reference 
 Idents(devforebrain) <- "Celltypes"
 # set the default assay to be RNA because those are the expression values we want
 DefaultAssay(devforebrain) <- "RNA"
+DefaultAssay(integrated_seurat) <- "RNA"
+
 
 # find the reference anchors
 anchors <- FindTransferAnchors(reference = devforebrain ,query = integrated_seurat, dims = 1:25)
@@ -826,6 +854,7 @@ https://sydneybiox.github.io/scClassify/articles/scClassify.html
 We need to make the reference and query objects into a "dgCMatrix" object
 
 ```{r}
+
 ref <- devforebrain
 
 ref$Level1 <- NULL
@@ -854,6 +883,10 @@ dgCMat_query <- GetAssayData(integrated_seurat)
 Idents(integrated_seurat) <- "integrated_snn_res.1"
 query_clusters <- Idents(integrated_seurat)
 
+Idents(integrated_seurat) <- "CellTypes"  
+query_celltypes <- Idents(integrated_seurat)
+
+length(query_clusters)
 # check the objects
 dim(dgCMat_ref)
 dim(dgCMat_query)
@@ -871,6 +904,9 @@ table(query_clusters)
 length(ref_celltypes)
 length(query_celltypes)
 
+query_celltypes[1:10]
+
+
 ```
 
 Run scClassify
@@ -879,13 +915,15 @@ Run scClassify
 scClassify_res <- scClassify(exprsMat_train = dgCMat_ref,
                              cellTypes_train = ref_celltypes,
                              exprsMat_test = dgCMat_query,
-                             cellTypes_test = query_clusters,
+                             cellTypes_test = query_celltypes,
                              tree = "HOPACH",
                              algorithm = "WKNN",
                              selectFeatures = c("limma"),
                              similarity = c("pearson"),
                              returnList = FALSE,
                              verbose = FALSE)
+
+
 
 ```
 
@@ -904,7 +942,7 @@ See the cell type predictions by cluster
 ```{r}
 
 table(scClassify_res$testRes$test$pearson_WKNN_limma$predRes,query_clusters)
-
+table(scClassify_res$testRes$test$pearson_WKNN_limma$predRes,query_celltypes)
 
 ```
 
