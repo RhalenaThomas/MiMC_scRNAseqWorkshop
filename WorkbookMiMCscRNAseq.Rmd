@@ -149,7 +149,6 @@ Filter out cells with too many RNA reads - these are likely doublets
 
 ```{r}
 
-
 #Remove any cells with more than 20% mitochondrial counts
 con_seu.ft <- subset(con_seu, percent.MT < 20)
 
